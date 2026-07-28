@@ -1,0 +1,77 @@
+# =============================================================================
+# Kehila Community Platform — Socket.IO WebSocket Server
+# =============================================================================
+# Deployed to: AWS ECS Fargate
+# Purpose: Real-time events — typing indicators, online presence,
+#          marketplace live chat, message broadcast, read receipts
+#
+# Build from project root:
+#   docker build -f infrastructure/docker/Dockerfile.ws-server -t platform-ws-server .
+#
+# Run:
+#   docker run -p 3002:3002 --env-file .env platform-ws-server
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder
+# Install dependencies and compile TypeScript
+# ---------------------------------------------------------------------------
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Enable pnpm via corepack
+RUN corepack enable && corepack prepare pnpm@10.28.2 --activate
+
+# Copy workspace configuration and lockfile first (for layer caching)
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+
+# Copy only the package.json files needed for dependency resolution
+COPY apps/ws-server/package.json apps/ws-server/
+COPY packages/db/package.json packages/db/
+COPY packages/cache/package.json packages/cache/
+
+# Install dependencies for ws-server and its workspace dependencies
+RUN pnpm install --frozen-lockfile --filter @platform/ws-server...
+
+# Copy source code for ws-server and its dependencies
+COPY apps/ws-server/ apps/ws-server/
+COPY packages/db/ packages/db/
+COPY packages/cache/ packages/cache/
+
+# Generate Prisma client (required for @platform/db)
+RUN pnpm --filter @platform/db db:generate
+
+# Build the ws-server TypeScript to JavaScript
+RUN pnpm --filter @platform/ws-server build
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runner
+# Minimal production image
+# ---------------------------------------------------------------------------
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# Create non-root user for security
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 socketio
+
+# Copy compiled output and dependencies from builder
+COPY --from=builder /app/apps/ws-server/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/packages/db/node_modules/.prisma ./node_modules/.prisma
+
+# Switch to non-root user
+USER socketio
+
+# Socket.IO server port
+EXPOSE 3002
+
+# Health check endpoint (assumes /health route in ws-server)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget --no-verbose --spider http://localhost:3002/health || exit 1
+
+CMD ["node", "dist/index.js"]

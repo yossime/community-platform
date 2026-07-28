@@ -1,0 +1,131 @@
+# =============================================================================
+# Kehila Community Platform — Local Development Stack
+# =============================================================================
+# Usage:
+#   cd infrastructure/docker
+#   docker compose up -d
+#
+# Services:
+#   - PostgreSQL 15 + pgvector  → localhost:5432
+#   - Redis 7                   → localhost:6379
+#   - Meilisearch               → localhost:7700
+#   - MailDev (email testing)   → localhost:1080 (UI), localhost:1025 (SMTP)
+#
+# Stop:
+#   docker compose down
+#
+# Stop + remove volumes (reset data):
+#   docker compose down -v
+# =============================================================================
+
+name: platform-dev
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 15 with pgvector extension
+  # Used as primary database via Supabase (locally emulated)
+  # pgvector enables AI embedding storage and cosine similarity search
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: platform-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-platform_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-platform_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 (Alpine)
+  # Used for caching (write-through), rate limiting (sliding window),
+  # buffered counters, and session storage via Upstash Redis protocol
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: platform-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Meilisearch
+  # Full-text search engine for forums, marketplace, classifieds, portfolios,
+  # courses, articles, and directory (7 indexes)
+  # Admin UI: http://localhost:7700
+  # ---------------------------------------------------------------------------
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    container_name: platform-meilisearch
+    restart: unless-stopped
+    ports:
+      - "7700:7700"
+    environment:
+      MEILI_ENV: ${MEILI_ENV:-development}
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-dev-master-key}
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meilisearch_data:/meili_data
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # MailDev — Local email testing
+  # Catches all outgoing emails for development (replaces Resend / AWS SES)
+  # Web UI: http://localhost:1080
+  # SMTP:   localhost:1025
+  # ---------------------------------------------------------------------------
+  maildev:
+    image: maildev/maildev
+    container_name: platform-maildev
+    restart: unless-stopped
+    ports:
+      - "1080:1080"  # Web UI for viewing captured emails
+      - "1025:1025"  # SMTP server for sending test emails
+    networks:
+      - platform-network
+
+# =============================================================================
+# Volumes — Persistent data storage
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  meilisearch_data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  platform-network:
+    driver: bridge

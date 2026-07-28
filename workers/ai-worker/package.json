@@ -1,0 +1,20 @@
+{
+  "name": "@platform/ai-worker",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --outdir=dist --format=cjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "openai": "^4.77.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.17.12",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.3"
+  }
+}

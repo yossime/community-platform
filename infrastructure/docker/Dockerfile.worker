@@ -1,0 +1,71 @@
+# =============================================================================
+# Kehila Community Platform — Lambda Worker (Generic)
+# =============================================================================
+# Parameterized Dockerfile for all Lambda-based workers:
+#   - ai-worker:           AI moderation, embeddings, content analysis
+#   - search-indexer:       Meilisearch sync (DB -> search indexes)
+#   - notification-worker:  Email (Resend/SES), WhatsApp, push notifications
+#   - media-processor:      Image resize, WebP conversion, BlurHash, EXIF strip
+#
+# Build from monorepo root with --build-arg WORKER_NAME:
+#   docker build -f infrastructure/docker/Dockerfile.worker \
+#     --build-arg WORKER_NAME=ai-worker \
+#     -t platform-ai-worker .
+#
+# The build context MUST be the monorepo root (for pnpm-lock.yaml and Prisma).
+# Each worker must export a handler function: handler.handler
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder
+# Install monorepo dependencies and compile the target worker
+# ---------------------------------------------------------------------------
+FROM public.ecr.aws/lambda/nodejs:20 AS builder
+
+ARG WORKER_NAME
+RUN test -n "$WORKER_NAME" || (echo "WORKER_NAME build arg is required" && exit 1)
+
+WORKDIR /build
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy workspace configuration and lockfile first (for layer caching)
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+
+# Copy only the package.json files needed for dependency resolution
+COPY workers/${WORKER_NAME}/package.json workers/${WORKER_NAME}/
+COPY packages/db/package.json packages/db/
+
+# Install dependencies for this worker and its workspace dependencies
+RUN pnpm install --frozen-lockfile --filter @platform/${WORKER_NAME}...
+
+# Copy source code for the worker and Prisma schema
+COPY workers/${WORKER_NAME}/ workers/${WORKER_NAME}/
+COPY packages/db/ packages/db/
+
+# Generate Prisma client
+RUN cd packages/db && npx prisma generate
+
+# Build the worker
+RUN cd workers/${WORKER_NAME} && pnpm build
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runner
+# AWS Lambda runtime with compiled handler
+# ---------------------------------------------------------------------------
+FROM public.ecr.aws/lambda/nodejs:20
+
+ARG WORKER_NAME
+
+# Copy compiled output to Lambda task root
+COPY --from=builder /build/workers/${WORKER_NAME}/dist/ ${LAMBDA_TASK_ROOT}/
+
+# Copy production dependencies
+COPY --from=builder /build/node_modules ${LAMBDA_TASK_ROOT}/node_modules
+
+# Copy Prisma generated client
+COPY --from=builder /build/packages/db/node_modules/.prisma ${LAMBDA_TASK_ROOT}/node_modules/.prisma
+
+# Lambda handler: expects exports.handler in handler.js
+CMD ["handler.handler"]

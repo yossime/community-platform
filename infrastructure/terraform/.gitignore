@@ -1,0 +1,21 @@
+# Terraform state (managed remotely via S3 backend)
+*.tfstate
+*.tfstate.backup
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Sensitive variable files (NEVER commit)
+terraform.tfvars
+*.auto.tfvars
+
+# SSH keys
+keys/meilisearch
+keys/meilisearch.pub
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Plan output files
+*.tfplan
