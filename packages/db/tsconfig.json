@@ -1,0 +1,5 @@
+{
+  "extends": "../../packages/config/typescript/library.json",
+  "include": ["src/**/*.ts", "prisma/seed.ts"],
+  "exclude": ["node_modules", "dist"]
+}
