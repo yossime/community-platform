@@ -1,0 +1,22 @@
+{
+  "name": "@platform/email",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/send.ts",
+  "types": "./src/send.ts",
+  "scripts": {
+    "lint": "eslint . --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist .turbo"
+  },
+  "dependencies": {
+    "@react-email/components": "^0.0.31",
+    "react": "^18.3.1",
+    "resend": "^4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "@types/react": "^18.3.18",
+    "typescript": "^5.7.3"
+  }
+}
