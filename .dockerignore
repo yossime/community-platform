@@ -1,0 +1,11 @@
+node_modules
+.git
+.next
+.turbo
+dist
+*.tsbuildinfo
+.env*
+!.env.example
+playwright-report
+e2e
+docs
