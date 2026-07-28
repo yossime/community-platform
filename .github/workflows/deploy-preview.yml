@@ -1,0 +1,152 @@
+name: Preview Deploy
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 20
+
+jobs:
+  deploy-preview:
+    name: Deploy to Vercel Preview
+    runs-on: ubuntu-latest
+    outputs:
+      preview-url: ${{ steps.vercel.outputs.preview-url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm turbo db:generate
+
+      - name: Build all packages
+        run: pnpm turbo build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.PREVIEW_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.PREVIEW_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.PREVIEW_STRIPE_PUBLISHABLE_KEY }}
+          NEXT_PUBLIC_APP_URL: https://preview.platform.co.il
+          NEXT_PUBLIC_WS_URL: ${{ secrets.PREVIEW_WS_URL }}
+          NEXT_PUBLIC_POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
+          NEXT_PUBLIC_POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+
+      - name: Deploy to Vercel Preview
+        id: vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Comment preview URL on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const previewUrl = '${{ steps.vercel.outputs.preview-url }}';
+            if (!previewUrl) return;
+
+            const body = `## Preview Deployment
+
+            | Resource | URL |
+            |----------|-----|
+            | Preview | [${previewUrl}](${previewUrl}) |
+
+            *Deployed from commit ${context.sha.substring(0, 7)}*`;
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('## Preview Deployment')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  lighthouse:
+    name: Lighthouse Audit
+    needs: deploy-preview
+    if: needs.deploy-preview.outputs.preview-url
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Lighthouse CI
+        uses: treosh/lighthouse-ci-action@v11
+        with:
+          urls: |
+            ${{ needs.deploy-preview.outputs.preview-url }}
+            ${{ needs.deploy-preview.outputs.preview-url }}/forums
+          budgetPath: .github/lighthouse-budget.json
+          uploadArtifacts: true
+
+  e2e:
+    name: E2E Tests (Playwright)
+    needs: deploy-preview
+    if: needs.deploy-preview.outputs.preview-url
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Playwright with dependencies
+        run: npx playwright install --with-deps
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install project dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Playwright E2E tests
+        run: npx playwright test
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ needs.deploy-preview.outputs.preview-url }}
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

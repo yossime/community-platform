@@ -1,0 +1,417 @@
+name: Production Deploy
+
+# Manual trigger only: deploying requires cloud credentials (Vercel, AWS,
+# Supabase) configured as repository secrets. Run from the Actions tab once
+# those secrets are in place. See DEPLOY.md for the full setup guide.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 20
+  AWS_REGION: eu-central-1
+  ENVIRONMENT: production
+  ECR_REPOSITORY_WS: platform-ws-server-production
+  ECS_CLUSTER: platform-cluster-production
+  ECS_SERVICE_WS: ws-server-production
+
+jobs:
+  # ---------------------------------------------------------------
+  # Step 1: Pre-deploy checks — ensure CI passed on this commit
+  # ---------------------------------------------------------------
+  pre-checks:
+    name: Pre-deploy Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify CI status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: checkRuns } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              check_name: 'Build',
+            });
+            const buildCheck = checkRuns.check_runs.find(cr => cr.name === 'Build');
+            if (!buildCheck || buildCheck.conclusion !== 'success') {
+              core.setFailed('CI Build check has not passed for this commit. Aborting deploy.');
+            }
+
+  # ---------------------------------------------------------------
+  # Step 2: Database migrations (must run before app deploy)
+  # ---------------------------------------------------------------
+  migrate-database:
+    name: Run Database Migrations
+    runs-on: ubuntu-latest
+    needs: pre-checks
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Prisma migrations
+        run: pnpm --filter @platform/db db:migrate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+
+  # ---------------------------------------------------------------
+  # Step 3: Deploy Next.js to Vercel (production)
+  # ---------------------------------------------------------------
+  deploy-vercel:
+    name: Deploy to Vercel (Production)
+    runs-on: ubuntu-latest
+    needs: migrate-database
+    environment: production
+    outputs:
+      deployment-url: ${{ steps.vercel.outputs.preview-url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm turbo db:generate
+
+      - name: Build all packages
+        run: pnpm turbo build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}
+          NEXT_PUBLIC_APP_URL: ${{ vars.APP_URL }}
+          NEXT_PUBLIC_WS_URL: ${{ secrets.NEXT_PUBLIC_WS_URL }}
+          NEXT_PUBLIC_POSTHOG_KEY: ${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}
+          NEXT_PUBLIC_POSTHOG_HOST: ${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+
+      - name: Deploy to Vercel Production
+        id: vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: "--prod"
+
+  # ---------------------------------------------------------------
+  # Step 4: Deploy Lambda workers to AWS (Docker/ECR)
+  # ---------------------------------------------------------------
+  deploy-workers:
+    name: Deploy Lambda Workers
+    runs-on: ubuntu-latest
+    needs: migrate-database
+    environment: production
+    strategy:
+      matrix:
+        worker:
+          - ai-worker
+          - search-indexer
+          - notification-worker
+          - media-processor
+      fail-fast: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push worker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          WORKER_NAME: ${{ matrix.worker }}
+        run: |
+          ECR_REPO="platform-${WORKER_NAME}-${ENVIRONMENT}"
+          docker build \
+            -f infrastructure/docker/Dockerfile.worker \
+            --build-arg WORKER_NAME="${WORKER_NAME}" \
+            -t "$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPO:latest" \
+            .
+          docker push "$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPO:latest"
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Lambda
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          WORKER_NAME: ${{ matrix.worker }}
+        run: |
+          ECR_REPO="platform-${WORKER_NAME}-${ENVIRONMENT}"
+          aws lambda update-function-code \
+            --function-name "platform-${WORKER_NAME}-${ENVIRONMENT}" \
+            --image-uri "$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" \
+            --publish
+
+      - name: Wait for Lambda update
+        run: |
+          aws lambda wait function-updated-v2 \
+            --function-name "platform-${{ matrix.worker }}-${{ env.ENVIRONMENT }}"
+
+  # ---------------------------------------------------------------
+  # Step 5: Deploy WebSocket server to ECS Fargate
+  # ---------------------------------------------------------------
+  deploy-ws-server:
+    name: Deploy WebSocket Server (ECS)
+    runs-on: ubuntu-latest
+    needs: migrate-database
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f infrastructure/docker/Dockerfile.ws-server \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY_WS:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY_WS:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_WS:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_WS:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY_WS:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_WS }} \
+            --force-new-deployment
+
+      - name: Wait for ECS deployment stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE_WS }}
+        timeout-minutes: 10
+
+  # ---------------------------------------------------------------
+  # Step 6: Reindex Meilisearch (if schema changed)
+  # ---------------------------------------------------------------
+  reindex-search:
+    name: Reindex Meilisearch
+    runs-on: ubuntu-latest
+    needs: [deploy-vercel, deploy-workers]
+    if: contains(github.event.head_commit.message, '[reindex]')
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run search reindex
+        run: pnpm --filter @platform/search reindex
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MEILISEARCH_HOST: ${{ secrets.MEILISEARCH_HOST }}
+          MEILISEARCH_API_KEY: ${{ secrets.MEILISEARCH_API_KEY }}
+
+  # ---------------------------------------------------------------
+  # Step 7: Post-deploy smoke tests
+  # ---------------------------------------------------------------
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-vercel, deploy-workers, deploy-ws-server]
+    environment: production
+    steps:
+      - name: Health check - Main app
+        run: |
+          for i in {1..5}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.APP_URL }}/api/health")
+            if [ "$status" = "200" ]; then
+              echo "Health check passed (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i failed with status $status, retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after 5 attempts"
+          exit 1
+
+      - name: Health check - Homepage
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.APP_URL }}/")
+          if [ "$status" != "200" ]; then
+            echo "Homepage returned status $status"
+            exit 1
+          fi
+          echo "Homepage check passed"
+
+      - name: Health check - tRPC endpoint
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.APP_URL }}/api/trpc/health")
+          if [ "$status" != "200" ] && [ "$status" != "400" ]; then
+            echo "tRPC endpoint returned unexpected status $status"
+            exit 1
+          fi
+          echo "tRPC endpoint check passed"
+
+      - name: Health check - WebSocket server
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.WS_HEALTH_URL }}")
+          if [ "$status" != "200" ]; then
+            echo "WebSocket server returned status $status"
+            exit 1
+          fi
+          echo "WebSocket server check passed"
+
+  # ---------------------------------------------------------------
+  # Step 8: Invalidate CDN cache
+  # ---------------------------------------------------------------
+  invalidate-cache:
+    name: Invalidate Caches
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Flush stale Redis cache keys
+        run: |
+          node -e "
+            const { Redis } = require('@upstash/redis');
+            const redis = new Redis({
+              url: process.env.UPSTASH_REDIS_REST_URL,
+              token: process.env.UPSTASH_REDIS_REST_TOKEN,
+            });
+            // Invalidate build-specific cache keys
+            async function flush() {
+              const keys = await redis.keys('cache:build:*');
+              if (keys.length > 0) {
+                await redis.del(...keys);
+                console.log('Flushed', keys.length, 'build cache keys');
+              } else {
+                console.log('No build cache keys to flush');
+              }
+            }
+            flush().catch(console.error);
+          "
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+
+  # ---------------------------------------------------------------
+  # Step 9: Notify on deploy result
+  # ---------------------------------------------------------------
+  notify:
+    name: Deploy Notification
+    runs-on: ubuntu-latest
+    needs: [deploy-vercel, deploy-workers, deploy-ws-server, smoke-tests]
+    if: always()
+    steps:
+      - name: Determine deploy status
+        id: status
+        run: |
+          if [ "${{ needs.deploy-vercel.result }}" = "success" ] && \
+             [ "${{ needs.deploy-workers.result }}" = "success" ] && \
+             [ "${{ needs.deploy-ws-server.result }}" = "success" ] && \
+             [ "${{ needs.smoke-tests.result }}" = "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=v" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=x" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.status.outputs.status }}';
+            const sha = context.sha.substring(0, 7);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Create a deployment status check
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: status === 'success' ? 'success' : 'failure',
+              target_url: runUrl,
+              description: status === 'success'
+                ? `Production deploy succeeded (${sha})`
+                : `Production deploy failed (${sha})`,
+              context: 'production-deploy',
+            });
+
+            console.log(`Deploy ${status} for commit ${sha}`);
