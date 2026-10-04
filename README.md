@@ -136,3 +136,7 @@ The platform is specified in 15 architecture documents under [`docs/architecture
 ## How It Was Built
 
 This platform was built AI-assisted: the architecture was specified up front in the 15 documents above, and the implementation was generated with Claude Code working against those specs — directed, reviewed, integrated, and deployed by me (Yossi Mendelovitz). The design decisions, the cultural/technical constraints (single-origin assets, RTL-first logical CSS, the moderation pipeline), the spec documents, and the debugging of everything from Prisma engine bundling on Vercel to Redis edge cases are human work; a large share of the line-by-line code is machine-generated to those specifications. I think this is an honest picture of how modern software gets built, and this repo is meant to show I can direct that process end to end.
+
+## License
+
+[MIT](LICENSE)
